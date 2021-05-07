@@ -23,7 +23,7 @@ const Connection = require('./connections/connection.js');
 const {getBrowserVersion} = require('./driver/environment.js');
 
 // Controls how long to wait for a response after sending a DevTools protocol command.
-const DEFAULT_PROTOCOL_TIMEOUT = 30000;
+const DEFAULT_PROTOCOL_TIMEOUT = 60000;
 
 /**
  * @typedef {LH.Protocol.StrictEventEmitter<LH.CrdpEvents>} CrdpEventEmitter
