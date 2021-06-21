@@ -178,7 +178,7 @@ declare global {
         patterns:any
         redirectMap:any
         logs:any
-      }
+      } | null
       /** Comma-delimited list of trace categories to include. */
       additionalTraceCategories?: string | null;
       /** Flag indicating the run should only audit. */

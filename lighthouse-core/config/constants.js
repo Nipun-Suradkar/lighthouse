@@ -113,6 +113,7 @@ const defaultSettings = {
   budgets: null,
   locale: 'en-US', // actual default determined by Config using lib/i18n
   blockedUrlPatterns: null,
+  redirectUrlPatterns: null,
   additionalTraceCategories: null,
   extraHeaders: null,
   precomputedLanternData: null,
