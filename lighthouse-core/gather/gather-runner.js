@@ -429,7 +429,25 @@ class GatherRunner {
     // No "clearing" is done at the end of the pass since Network.setBlockedURLs([]) will unset all if
     // neccessary at the beginning of the next pass.
     await session.sendCommand('Network.setBlockedURLs', {urls: blockedUrls});
+    if (passContext.settings.redirectUrlPatterns) {
+      const redirectOptions = passContext.settings.redirectUrlPatterns;
+      await session.sendCommand('Fetch.enable', {
+        patterns: redirectOptions.patterns,
+      });
 
+      await session.on('Fetch.requestPaused', async (event) => {
+        if (!event.responseStatusCode) {
+          console.log('Script Url Blocked:', event.request.url);
+          const redirectedURL = redirectOptions.redirectMap[event.request.url];
+          await session.sendCommand('Fetch.continueRequest', {
+            requestId: event.requestId,
+            url: redirectedURL,
+          });
+          console.log('Redirect Script URL: ', redirectedURL);
+          redirectOptions.logs.push({sourceUrl: event.request.url, redirectUrl: redirectedURL});
+        }
+      });
+    }
     const headers = passContext.settings.extraHeaders;
     if (headers) await session.sendCommand('Network.setExtraHTTPHeaders', {headers});
 

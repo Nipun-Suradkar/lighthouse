@@ -174,6 +174,11 @@ declare global {
       maxWaitForLoad?: number;
       /** List of URL patterns to block. */
       blockedUrlPatterns?: string[] | null;
+      redirectUrlPatterns?:{
+        patterns:any
+        redirectMap:any
+        logs:any
+      }
       /** Comma-delimited list of trace categories to include. */
       additionalTraceCategories?: string | null;
       /** Flag indicating the run should only audit. */
