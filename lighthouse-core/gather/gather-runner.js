@@ -444,7 +444,6 @@ class GatherRunner {
             url: redirectedURL,
           });
           console.log('Redirect Script URL: ', redirectedURL);
-          redirectOptions.logs.push({sourceUrl: event.request.url, redirectUrl: redirectedURL});
         }
       });
     }

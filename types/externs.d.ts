@@ -177,7 +177,6 @@ declare global {
       redirectUrlPatterns?:{
         patterns:any
         redirectMap:any
-        logs:any
       } | null
       /** Comma-delimited list of trace categories to include. */
       additionalTraceCategories?: string | null;
