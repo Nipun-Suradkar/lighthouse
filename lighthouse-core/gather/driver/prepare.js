@@ -111,6 +111,24 @@ async function prepareNetworkForNavigation(session, settings, navigation) {
   );
   await session.sendCommand('Network.setBlockedURLs', {urls: blockedUrls});
 
+  if (settings.redirectUrlPatterns) {
+    const redirectOptions = settings.redirectUrlPatterns;
+    await session.sendCommand('Fetch.enable', {
+      patterns: redirectOptions.patterns,
+    });
+
+    await session.on('Fetch.requestPaused', async (event) => {
+      if (!event.responseStatusCode) {
+        console.log('Script Url Blocked:', event.request.url);
+        const redirectedURL = redirectOptions.redirectMap[event.request.url];
+        await session.sendCommand('Fetch.continueRequest', {
+          requestId: event.requestId,
+          url: redirectedURL,
+        });
+        console.log('Redirect Script URL: ', redirectedURL);
+      }
+    });
+  }
   const headers = settings.extraHeaders;
   if (headers) await session.sendCommand('Network.setExtraHTTPHeaders', {headers});
 
