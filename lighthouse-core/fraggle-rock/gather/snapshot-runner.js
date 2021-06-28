@@ -13,7 +13,7 @@ const {
   awaitArtifacts,
 } = require('./runner-helpers.js');
 const {initializeConfig} = require('../config/config.js');
-const {getBaseArtifacts} = require('./base-artifacts.js');
+const {getBaseArtifacts, finalizeArtifacts} = require('./base-artifacts.js');
 
 /** @param {{page: import('puppeteer').Page, config?: LH.Config.Json}} options */
 async function snapshot(options) {
@@ -21,6 +21,8 @@ async function snapshot(options) {
   const driver = new Driver(options.page);
   await driver.connect();
 
+  /** @type {Map<string, LH.ArbitraryEqualityMap>} */
+  const computedCache = new Map();
   const url = await options.page.url();
 
   return Runner.run(
@@ -37,14 +39,17 @@ async function snapshot(options) {
         driver,
         artifactDefinitions,
         artifactState,
+        computedCache,
+        settings: config.settings,
       });
 
       const artifacts = await awaitArtifacts(artifactState);
-      return /** @type {LH.Artifacts} */ ({...baseArtifacts, ...artifacts}); // Cast to drop Partial<>
+      return finalizeArtifacts(baseArtifacts, artifacts);
     },
     {
       url,
       config,
+      computedCache,
     }
   );
 }

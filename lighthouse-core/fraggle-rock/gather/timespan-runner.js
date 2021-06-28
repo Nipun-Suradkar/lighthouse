@@ -13,7 +13,7 @@ const {
   awaitArtifacts,
 } = require('./runner-helpers.js');
 const {initializeConfig} = require('../config/config.js');
-const {getBaseArtifacts} = require('./base-artifacts.js');
+const {getBaseArtifacts, finalizeArtifacts} = require('./base-artifacts.js');
 
 /**
  * @param {{page: import('puppeteer').Page, config?: LH.Config.Json}} options
@@ -24,11 +24,21 @@ async function startTimespan(options) {
   const driver = new Driver(options.page);
   await driver.connect();
 
+  /** @type {Map<string, LH.ArbitraryEqualityMap>} */
+  const computedCache = new Map();
   const artifactDefinitions = config.artifacts || [];
   const requestedUrl = await options.page.url();
   const artifactState = getEmptyArtifactState();
   /** @type {Omit<import('./runner-helpers.js').CollectPhaseArtifactOptions, 'phase'>} */
-  const phaseOptions = {driver, artifactDefinitions, artifactState, gatherMode: 'timespan'};
+  const phaseOptions = {
+    driver,
+    artifactDefinitions,
+    artifactState,
+    computedCache,
+    gatherMode: 'timespan',
+    settings: config.settings,
+  };
+
   await collectPhaseArtifacts({phase: 'startInstrumentation', ...phaseOptions});
   await collectPhaseArtifacts({phase: 'startSensitiveInstrumentation', ...phaseOptions});
 
@@ -46,11 +56,12 @@ async function startTimespan(options) {
           await collectPhaseArtifacts({phase: 'getArtifact', ...phaseOptions});
 
           const artifacts = await awaitArtifacts(artifactState);
-          return /** @type {LH.Artifacts} */ ({...baseArtifacts, ...artifacts}); // Cast to drop Partial<>
+          return finalizeArtifacts(baseArtifacts, artifacts);
         },
         {
           url: finalUrl,
           config,
+          computedCache,
         }
       );
     },

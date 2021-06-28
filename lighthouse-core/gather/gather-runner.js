@@ -6,14 +6,13 @@
 'use strict';
 
 const log = require('lighthouse-logger');
-const LHError = require('../lib/lh-error.js');
-const NetworkAnalyzer = require('../lib/dependency-graph/simulator/network-analyzer.js');
-const NetworkRecorder = require('../lib/network-recorder.js');
+const NetworkRecords = require('../computed/network-records.js');
+const {getPageLoadError} = require('../lib/navigation-error.js');
 const emulation = require('../lib/emulation.js');
 const constants = require('../config/constants.js');
 const i18n = require('../lib/i18n/i18n.js');
-const URL = require('../lib/url-shim.js');
-const {getBenchmarkIndex} = require('./driver/environment.js');
+const {getBenchmarkIndex, getEnvironmentWarnings} = require('./driver/environment.js');
+const prepare = require('./driver/prepare.js');
 const storage = require('./driver/storage.js');
 const navigation = require('./driver/navigation.js');
 const serviceWorkers = require('./driver/service-workers.js');
@@ -21,40 +20,10 @@ const WebAppManifest = require('./gatherers/web-app-manifest.js');
 const InstallabilityErrors = require('./gatherers/installability-errors.js');
 const NetworkUserAgent = require('./gatherers/network-user-agent.js');
 const Stacks = require('./gatherers/stacks.js');
-
-const UIStrings = {
-  /**
-   * @description Warning that the web page redirected during testing and that may have affected the load.
-   * @example {https://example.com/requested/page} requested
-   * @example {https://example.com/final/resolved/page} final
-   */
-  warningRedirected: 'The page may not be loading as expected because your test URL ' +
-  `({requested}) was redirected to {final}. ` +
-  'Try testing the second URL directly.',
-  /**
-   * @description Warning that Lighthouse timed out while waiting for the page to load.
-   */
-  warningTimeout: 'The page loaded too slowly to finish within the time limit. ' +
-  'Results may be incomplete.',
-  /**
-   * @description Warning that the host device where Lighthouse is running appears to have a slower
-   * CPU than the expected Lighthouse baseline.
-   */
-  warningSlowHostCpu: 'The tested device appears to have a slower CPU than  ' +
-  'Lighthouse expects. This can negatively affect your performance score. Learn more about ' +
-  '[calibrating an appropriate CPU slowdown multiplier](https://github.com/GoogleChrome/lighthouse/blob/master/docs/throttling.md#cpu-throttling).',
-};
-
-/**
- * We want to warn when the CPU seemed to be at least ~2x weaker than our regular target device.
- * We're starting with a more conservative value that will increase over time to our true target threshold.
- * @see https://github.com/GoogleChrome/lighthouse/blob/ccbc8002fd058770d14e372a8301cc4f7d256414/docs/throttling.md#calibrating-multipliers
- */
-const SLOW_CPU_BENCHMARK_INDEX_THRESHOLD = 1000;
-
-const str_ = i18n.createMessageInstanceIdFn(__filename, UIStrings);
+const {finalizeArtifacts} = require('../fraggle-rock/gather/base-artifacts.js');
 
 /** @typedef {import('../gather/driver.js')} Driver */
+/** @typedef {import('../lib/arbitrary-equality-map.js')} ArbitraryEqualityMap */
 
 /**
  * Each entry in each gatherer result array is the output of a gatherer phase:
@@ -101,7 +70,8 @@ class GatherRunner {
     };
     log.time(status);
     try {
-      const {finalUrl, timedOut} = await navigation.gotoURL(driver, passContext.url, {
+      const requestedUrl = passContext.url;
+      const {finalUrl, warnings} = await navigation.gotoURL(driver, requestedUrl, {
         waitUntil: passContext.passConfig.recordTrace ?
           ['load', 'fcp'] : ['load'],
         maxWaitForFcp: passContext.settings.maxWaitForFcp,
@@ -109,7 +79,9 @@ class GatherRunner {
         ...passContext.passConfig,
       });
       passContext.url = finalUrl;
-      if (timedOut) passContext.LighthouseRunWarnings.push(str_(UIStrings.warningTimeout));
+      if (passContext.passConfig.loadFailureMode === 'fatal') {
+        passContext.LighthouseRunWarnings.push(...warnings);
+      }
     } catch (err) {
       // If it's one of our loading-based LHErrors, we'll treat it as a page load error.
       if (err.code === 'NO_FCP' || err.code === 'PAGE_HUNG') {
@@ -174,46 +146,19 @@ class GatherRunner {
   /**
    * @param {Driver} driver
    * @param {{requestedUrl: string, settings: LH.Config.Settings}} options
-   * @param {(string | LH.IcuMessage)[]} LighthouseRunWarnings
    * @return {Promise<void>}
    */
-  static async setupDriver(driver, options, LighthouseRunWarnings) {
+  static async setupDriver(driver, options) {
     const status = {msg: 'Initializing…', id: 'lh:gather:setupDriver'};
     log.time(status);
-    const resetStorage = !options.settings.disableStorageReset;
     const session = driver.defaultSession;
 
     // Assert no service workers are still installed, so we test that they would actually be installed for a new user.
     // TODO(FR-COMPAT): re-evaluate the necessity of this check
     await GatherRunner.assertNoSameOriginServiceWorkerClients(session, options.requestedUrl);
 
-    // Emulate our target device screen and user agent.
-    await emulation.emulate(driver.defaultSession, options.settings);
+    await prepare.prepareTargetForNavigationMode(driver, options.settings);
 
-    // Enable `Debugger` domain to receive async stacktrace information on network request initiators.
-    // This is critical for tracing certain performance simulation situations.
-    session.on('Debugger.paused', () => session.sendCommand('Debugger.resume'));
-    await session.sendCommand('Debugger.enable');
-    await session.sendCommand('Debugger.setSkipAllPauses', {skip: true});
-    await session.sendCommand('Debugger.setAsyncCallStackDepth', {maxDepth: 8});
-
-    // Inject our snippet to cache important web platform APIs before they're (possibly) ponyfilled by the page.
-    await driver.executionContext.cacheNativesOnNewDocument();
-
-    // Automatically handle any JavaScript dialogs to prevent a hung renderer.
-    await driver.dismissJavaScriptDialogs();
-
-    // Wrap requestIdleCallback so pages under simulation receive the correct rIC deadlines.
-    await driver.registerRequestIdleCallbackWrap(options.settings);
-
-    // Reset the storage and warn if there appears to be other important data.
-    if (resetStorage) {
-      const warning = await storage.getImportantStorageWarning(session, options.requestedUrl);
-      if (warning) {
-        LighthouseRunWarnings.push(warning);
-      }
-      await storage.clearDataForOrigin(session, options.requestedUrl);
-    }
     log.timeEnd(status);
   }
 
@@ -246,210 +191,6 @@ class GatherRunner {
         log.error('GatherRunner disconnect', err.message);
       }
     }
-    log.timeEnd(status);
-  }
-
-  /**
-   * Returns an error if the original network request failed or wasn't found.
-   * @param {LH.Artifacts.NetworkRequest|undefined} mainRecord
-   * @return {LH.LighthouseError|undefined}
-   */
-  static getNetworkError(mainRecord) {
-    if (!mainRecord) {
-      return new LHError(LHError.errors.NO_DOCUMENT_REQUEST);
-    } else if (mainRecord.failed) {
-      const netErr = mainRecord.localizedFailDescription;
-      // Match all resolution and DNS failures
-      // https://cs.chromium.org/chromium/src/net/base/net_error_list.h?rcl=cd62979b
-      if (
-        netErr === 'net::ERR_NAME_NOT_RESOLVED' ||
-        netErr === 'net::ERR_NAME_RESOLUTION_FAILED' ||
-        netErr.startsWith('net::ERR_DNS_')
-      ) {
-        return new LHError(LHError.errors.DNS_FAILURE);
-      } else {
-        return new LHError(
-          LHError.errors.FAILED_DOCUMENT_REQUEST,
-          {errorDetails: netErr}
-        );
-      }
-    } else if (mainRecord.hasErrorStatusCode()) {
-      return new LHError(
-        LHError.errors.ERRORED_DOCUMENT_REQUEST,
-        {statusCode: `${mainRecord.statusCode}`}
-      );
-    }
-  }
-
-  /**
-   * Returns an error if we ended up on the `chrome-error` page and all other requests failed.
-   * @param {LH.Artifacts.NetworkRequest|undefined} mainRecord
-   * @param {Array<LH.Artifacts.NetworkRequest>} networkRecords
-   * @return {LH.LighthouseError|undefined}
-   */
-  static getInterstitialError(mainRecord, networkRecords) {
-    // If we never requested a document, there's no interstitial error, let other cases handle it.
-    if (!mainRecord) return undefined;
-
-    const interstitialRequest = networkRecords
-      .find(record => record.documentURL.startsWith('chrome-error://'));
-    // If the page didn't end up on a chrome interstitial, there's no error here.
-    if (!interstitialRequest) return undefined;
-
-    // If the main document didn't fail, we didn't end up on an interstitial.
-    // FIXME: This doesn't handle client-side redirects.
-    // None of our error-handling deals with this case either because passContext.url doesn't handle non-network redirects.
-    if (!mainRecord.failed) return undefined;
-
-    // If a request failed with the `net::ERR_CERT_*` collection of errors, then it's a security issue.
-    if (mainRecord.localizedFailDescription.startsWith('net::ERR_CERT')) {
-      return new LHError(LHError.errors.INSECURE_DOCUMENT_REQUEST, {securityMessages:
-        mainRecord.localizedFailDescription});
-    }
-
-    // If we made it this far, it's a generic Chrome interstitial error.
-    return new LHError(LHError.errors.CHROME_INTERSTITIAL_ERROR);
-  }
-
-  /**
-   * Returns an error if we try to load a non-HTML page.
-   * Expects a network request with all redirects resolved, otherwise the MIME type may be incorrect.
-   * @param {LH.Artifacts.NetworkRequest|undefined} finalRecord
-   * @return {LH.LighthouseError|undefined}
-   */
-  static getNonHtmlError(finalRecord) {
-    // MIME types are case-insenstive but Chrome normalizes MIME types to be lowercase.
-    const HTML_MIME_TYPE = 'text/html';
-
-    // If we never requested a document, there's no doctype error, let other cases handle it.
-    if (!finalRecord) return undefined;
-
-    // mimeType is determined by the browser, we assume Chrome is determining mimeType correctly,
-    // independently of 'Content-Type' response headers, and always sending mimeType if well-formed.
-    if (HTML_MIME_TYPE !== finalRecord.mimeType) {
-      return new LHError(LHError.errors.NOT_HTML, {mimeType: finalRecord.mimeType});
-    }
-    return undefined;
-  }
-
-  /**
-   * Returns an error if the page load should be considered failed, e.g. from a
-   * main document request failure, a security issue, etc.
-   * @param {LH.Gatherer.PassContext} passContext
-   * @param {LH.Gatherer.LoadData} loadData
-   * @param {LH.LighthouseError|undefined} navigationError
-   * @return {LH.LighthouseError|undefined}
-   */
-  static getPageLoadError(passContext, loadData, navigationError) {
-    const {networkRecords} = loadData;
-    /** @type {LH.Artifacts.NetworkRequest|undefined} */
-    let mainRecord;
-    try {
-      mainRecord = NetworkAnalyzer.findMainDocument(networkRecords, passContext.url);
-    } catch (_) {}
-
-    // MIME Type is only set on the final redirected document request. Use this for the HTML check instead of root.
-    let finalRecord;
-    if (mainRecord) {
-      finalRecord = NetworkAnalyzer.resolveRedirects(mainRecord);
-    }
-
-    const networkError = GatherRunner.getNetworkError(mainRecord);
-    const interstitialError = GatherRunner.getInterstitialError(mainRecord, networkRecords);
-    const nonHtmlError = GatherRunner.getNonHtmlError(finalRecord);
-
-    // Check to see if we need to ignore the page load failure.
-    // e.g. When the driver is offline, the load will fail without page offline support.
-    if (passContext.passConfig.loadFailureMode === 'ignore') return;
-
-    // We want to special-case the interstitial beyond FAILED_DOCUMENT_REQUEST. See https://github.com/GoogleChrome/lighthouse/pull/8865#issuecomment-497507618
-    if (interstitialError) return interstitialError;
-
-    // Network errors are usually the most specific and provide the best reason for why the page failed to load.
-    // Prefer networkError over navigationError.
-    // Example: `DNS_FAILURE` is better than `NO_FCP`.
-    if (networkError) return networkError;
-
-    // Error if page is not HTML.
-    if (nonHtmlError) return nonHtmlError;
-
-    // Navigation errors are rather generic and express some failure of the page to render properly.
-    // Use `navigationError` as the last resort.
-    // Example: `NO_FCP`, the page never painted content for some unknown reason.
-    return navigationError;
-  }
-
-  /**
-   * Returns a warning if the host device appeared to be underpowered according to BenchmarkIndex.
-   *
-   * @param {Pick<LH.Gatherer.PassContext, 'settings'|'baseArtifacts'>} passContext
-   * @return {LH.IcuMessage | undefined}
-   */
-  static getSlowHostCpuWarning(passContext) {
-    const {settings, baseArtifacts} = passContext;
-    const {throttling, throttlingMethod} = settings;
-    const defaultThrottling = constants.defaultSettings.throttling;
-
-    // We only want to warn when the user can take an action to fix it.
-    // Eventually, this should expand to cover DevTools.
-    if (settings.channel !== 'cli') return;
-
-    // Only warn if they are using the default throttling settings.
-    const isThrottledMethod = throttlingMethod === 'simulate' || throttlingMethod === 'devtools';
-    const isDefaultMultiplier =
-      throttling.cpuSlowdownMultiplier === defaultThrottling.cpuSlowdownMultiplier;
-    if (!isThrottledMethod || !isDefaultMultiplier) return;
-
-    // Only warn if the device didn't meet the threshold.
-    // See https://github.com/GoogleChrome/lighthouse/blob/master/docs/throttling.md#cpu-throttling
-    if (baseArtifacts.BenchmarkIndex > SLOW_CPU_BENCHMARK_INDEX_THRESHOLD) return;
-
-    return str_(UIStrings.warningSlowHostCpu);
-  }
-
-  /**
-   * Initialize network settings for the pass, e.g. throttling, blocked URLs,
-   * and manual request headers.
-   * @param {LH.Gatherer.PassContext} passContext
-   * @return {Promise<void>}
-   */
-  static async setupPassNetwork(passContext) {
-    const status = {msg: 'Setting up network for the pass trace', id: `lh:gather:setupPassNetwork`};
-    log.time(status);
-
-    const session = passContext.driver.defaultSession;
-    const passConfig = passContext.passConfig;
-    if (passConfig.useThrottling) await emulation.throttle(session, passContext.settings);
-    else await emulation.clearThrottling(session);
-
-    const blockedUrls = (passContext.passConfig.blockedUrlPatterns || [])
-      .concat(passContext.settings.blockedUrlPatterns || []);
-
-    // Set request blocking before any network activity
-    // No "clearing" is done at the end of the pass since Network.setBlockedURLs([]) will unset all if
-    // neccessary at the beginning of the next pass.
-    await session.sendCommand('Network.setBlockedURLs', {urls: blockedUrls});
-    if (passContext.settings.redirectUrlPatterns) {
-      const redirectOptions = passContext.settings.redirectUrlPatterns;
-      await session.sendCommand('Fetch.enable', {
-        patterns: redirectOptions.patterns,
-      });
-
-      await session.on('Fetch.requestPaused', async (event) => {
-        if (!event.responseStatusCode) {
-          console.log('Script Url Blocked:', event.request.url);
-          const redirectedURL = redirectOptions.redirectMap[event.request.url];
-          await session.sendCommand('Fetch.continueRequest', {
-            requestId: event.requestId,
-            url: redirectedURL,
-          });
-          console.log('Redirect Script URL: ', redirectedURL);
-        }
-      });
-    }
-    const headers = passContext.settings.extraHeaders;
-    if (headers) await session.sendCommand('Network.setExtraHTTPHeaders', {headers});
-
     log.timeEnd(status);
   }
 
@@ -497,7 +238,7 @@ class GatherRunner {
     };
     log.time(status);
     const devtoolsLog = driver.endDevtoolsLog();
-    const networkRecords = NetworkRecorder.recordsFromLogs(devtoolsLog);
+    const networkRecords = await NetworkRecords.request(devtoolsLog, passContext);
     log.timeEnd(status);
 
     return {
@@ -684,13 +425,6 @@ class GatherRunner {
 
     // Copy redirected URL to artifact.
     baseArtifacts.URL.finalUrl = passContext.url;
-    /* eslint-disable max-len */
-    if (!URL.equalWithExcludedFragments(baseArtifacts.URL.requestedUrl, baseArtifacts.URL.finalUrl)) {
-      baseArtifacts.LighthouseRunWarnings.push(str_(UIStrings.warningRedirected, {
-        requested: baseArtifacts.URL.requestedUrl,
-        final: baseArtifacts.URL.finalUrl,
-      }));
-    }
 
     // Fetch the manifest, if it exists.
     baseArtifacts.WebAppManifest = await WebAppManifest.getWebAppManifest(
@@ -707,27 +441,15 @@ class GatherRunner {
     const devtoolsLog = baseArtifacts.devtoolsLogs[passContext.passConfig.passName];
     baseArtifacts.NetworkUserAgent = NetworkUserAgent.getNetworkUserAgent(devtoolsLog);
 
-    const slowCpuWarning = GatherRunner.getSlowHostCpuWarning(passContext);
-    if (slowCpuWarning) baseArtifacts.LighthouseRunWarnings.push(slowCpuWarning);
+    const environmentWarnings = getEnvironmentWarnings(passContext);
+    baseArtifacts.LighthouseRunWarnings.push(...environmentWarnings);
 
     log.timeEnd(status);
   }
 
   /**
-   * Finalize baseArtifacts after gathering is fully complete.
-   * @param {LH.BaseArtifacts} baseArtifacts
-   */
-  static finalizeBaseArtifacts(baseArtifacts) {
-    // Take only unique LighthouseRunWarnings.
-    baseArtifacts.LighthouseRunWarnings = Array.from(new Set(baseArtifacts.LighthouseRunWarnings));
-
-    // Take the timing entries we've gathered so far.
-    baseArtifacts.Timing = log.getTimeEntries();
-  }
-
-  /**
    * @param {Array<LH.Config.Pass>} passConfigs
-   * @param {{driver: Driver, requestedUrl: string, settings: LH.Config.Settings}} options
+   * @param {{driver: Driver, requestedUrl: string, settings: LH.Config.Settings, computedCache: Map<string, ArbitraryEqualityMap>}} options
    * @return {Promise<LH.Artifacts>}
    */
   static async run(passConfigs, options) {
@@ -745,7 +467,7 @@ class GatherRunner {
       const baseArtifacts = await GatherRunner.initializeBaseArtifacts(options);
       baseArtifacts.BenchmarkIndex = await getBenchmarkIndex(driver.executionContext);
 
-      await GatherRunner.setupDriver(driver, options, baseArtifacts.LighthouseRunWarnings);
+      await GatherRunner.setupDriver(driver, options);
 
       let isFirstPass = true;
       for (const passConfig of passConfigs) {
@@ -757,6 +479,7 @@ class GatherRunner {
           settings: options.settings,
           passConfig,
           baseArtifacts,
+          computedCache: options.computedCache,
           LighthouseRunWarnings: baseArtifacts.LighthouseRunWarnings,
         };
         const passResults = await GatherRunner.runPass(passContext);
@@ -781,25 +504,13 @@ class GatherRunner {
       }
 
       await GatherRunner.disposeDriver(driver, options);
-      GatherRunner.finalizeBaseArtifacts(baseArtifacts);
-      return /** @type {LH.Artifacts} */ ({...baseArtifacts, ...artifacts}); // Cast to drop Partial<>.
+      return finalizeArtifacts(baseArtifacts, artifacts);
     } catch (err) {
       // Clean up on error. Don't await so that the root error, not a disposal error, is shown.
       GatherRunner.disposeDriver(driver, options);
 
       throw err;
     }
-  }
-
-  /**
-   * Returns whether this pass should clear the caches.
-   * Only if it is a performance run and the settings don't disable it.
-   * @param {LH.Gatherer.PassContext} passContext
-   * @return {boolean}
-   */
-  static shouldClearCaches(passContext) {
-    const {settings, passConfig} = passContext;
-    return !settings.disableStorageReset && passConfig.recordTrace && passConfig.useThrottling;
   }
 
   /**
@@ -817,7 +528,7 @@ class GatherRunner {
   /**
    * Starting from about:blank, load the page and run gatherers for this pass.
    * @param {LH.Gatherer.PassContext} passContext
-   * @return {Promise<{artifacts: Partial<LH.GathererArtifacts>, pageLoadError?: LHError}>}
+   * @return {Promise<{artifacts: Partial<LH.GathererArtifacts>, pageLoadError?: LH.LighthouseError}>}
    */
   static async runPass(passContext) {
     const status = {
@@ -833,10 +544,17 @@ class GatherRunner {
 
     // Go to about:blank, set up, and run `beforePass()` on gatherers.
     await GatherRunner.loadBlank(driver, passConfig.blankPage);
-    await GatherRunner.setupPassNetwork(passContext);
-    if (GatherRunner.shouldClearCaches(passContext)) {
-      await storage.cleanBrowserCaches(driver.defaultSession); // Clear disk & memory cache if it's a perf run
-    }
+    const {warnings} = await prepare.prepareTargetForIndividualNavigation(
+      driver.defaultSession,
+      passContext.settings,
+      {
+        url: passContext.url,
+        disableStorageReset: !passConfig.useThrottling,
+        disableThrottling: !passConfig.useThrottling,
+        blockedUrlPatterns: passConfig.blockedUrlPatterns,
+      }
+    );
+    passContext.LighthouseRunWarnings.push(...warnings);
     await GatherRunner.beforePass(passContext, gathererResults);
 
     // Navigate, start recording, and run `pass()` on gatherers.
@@ -845,11 +563,15 @@ class GatherRunner {
     await GatherRunner.pass(passContext, gathererResults);
     const loadData = await GatherRunner.endRecording(passContext);
 
-    // Disable throttling so the afterPass analysis isn't throttled
+    // Disable throttling so the afterPass analysis isn't throttled.
     await emulation.clearThrottling(driver.defaultSession);
 
     // In case of load error, save log and trace with an error prefix, return no artifacts for this pass.
-    const pageLoadError = GatherRunner.getPageLoadError(passContext, loadData, possibleNavError);
+    const pageLoadError = getPageLoadError(possibleNavError, {
+      url: passContext.url,
+      loadFailureMode: passConfig.loadFailureMode,
+      networkRecords: loadData.networkRecords,
+    });
     if (pageLoadError) {
       const localizedMessage = i18n.getFormatted(pageLoadError.friendlyMessage,
           passContext.settings.locale);
@@ -876,4 +598,3 @@ class GatherRunner {
 }
 
 module.exports = GatherRunner;
-module.exports.UIStrings = UIStrings;

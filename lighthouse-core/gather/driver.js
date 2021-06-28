@@ -8,14 +8,12 @@
 const Fetcher = require('./fetcher.js');
 const ExecutionContext = require('./driver/execution-context.js');
 const LHError = require('../lib/lh-error.js');
-const NetworkRequest = require('../lib/network-request.js');
+const {fetchResponseBodyFromCache} = require('../gather/driver/network.js');
 const EventEmitter = require('events').EventEmitter;
 
 const log = require('lighthouse-logger');
 const DevtoolsLog = require('./devtools-log.js');
 const TraceGatherer = require('./gatherers/trace.js');
-
-const pageFunctions = require('../lib/page-functions.js');
 
 // Pulled in for Connection type checking.
 // eslint-disable-next-line no-unused-vars
@@ -386,13 +384,7 @@ class Driver {
    * @return {Promise<string>}
    */
   async getRequestContent(requestId, timeout = 1000) {
-    requestId = NetworkRequest.getRequestIdForBackend(requestId);
-
-    // Encoding issues may lead to hanging getResponseBody calls: https://github.com/GoogleChrome/lighthouse/pull/4718
-    // driver.sendCommand will handle timeout after 1s.
-    this.setNextProtocolTimeout(timeout);
-    const result = await this.sendCommand('Network.getResponseBody', {requestId});
-    return result.body;
+    return fetchResponseBodyFromCache(this.defaultSession, requestId, timeout);
   }
 
   /**
@@ -461,39 +453,6 @@ class Driver {
   endDevtoolsLog() {
     this._devtoolsLog.endRecording();
     return this._devtoolsLog.messages;
-  }
-
-  /**
-   * Use a RequestIdleCallback shim for tests run with simulated throttling, so that the deadline can be used without
-   * a penalty
-   * @param {LH.Config.Settings} settings
-   * @return {Promise<void>}
-   */
-  async registerRequestIdleCallbackWrap(settings) {
-    if (settings.throttlingMethod === 'simulate') {
-      await this.executionContext.evaluateOnNewDocument(
-        pageFunctions.wrapRequestIdleCallback,
-        {args: [settings.throttling.cpuSlowdownMultiplier]}
-      );
-    }
-  }
-
-  /**
-   * Dismiss JavaScript dialogs (alert, confirm, prompt), providing a
-   * generic promptText in case the dialog is a prompt.
-   * @return {Promise<void>}
-   */
-  async dismissJavaScriptDialogs() {
-    this.on('Page.javascriptDialogOpening', data => {
-      log.warn('Driver', `${data.type} dialog opened by the page automatically suppressed.`);
-
-      this.sendCommand('Page.handleJavaScriptDialog', {
-        accept: true,
-        promptText: 'Lighthouse prompt response',
-      }).catch(err => log.warn('Driver', err));
-    });
-
-    await this.sendCommand('Page.enable');
   }
 }
 
